@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=PipeWire Auto Router
+GenericName=Audio Patchbay
+Comment=Connect PipeWire audio streams and manage automatic reconnection
+Exec="@EXECUTABLE@"
+Icon=audio-card
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=PipeWire;Audio;Patchbay;Routing;KDE;
+StartupNotify=true

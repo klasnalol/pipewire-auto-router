@@ -1,0 +1,5 @@
+qt-build/
+qt-release-build/
+build/
+__pycache__/
+tests/__pycache__/
