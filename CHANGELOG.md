@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1 - 2026-10-14
 
 - Make the headless watcher react to PipeWire graph events instead of polling
   every two seconds, reducing reconnect latency and idle work.

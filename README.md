@@ -19,13 +19,13 @@ that Helvum displays.
 
 ## Install A Release On KDE
 
-Download `pipewire-auto-router-0.2.0-linux-x86_64.tar.gz` and `SHA256SUMS`,
+Download `pipewire-auto-router-0.2.1-linux-x86_64.tar.gz` and `SHA256SUMS`,
 then run:
 
 ```sh
 sha256sum --check SHA256SUMS --ignore-missing
-tar -xzf pipewire-auto-router-0.2.0-linux-x86_64.tar.gz
-cd pipewire-auto-router-0.2.0-linux-x86_64
+tar -xzf pipewire-auto-router-0.2.1-linux-x86_64.tar.gz
+cd pipewire-auto-router-0.2.1-linux-x86_64
 ./install-kde-app.sh
 ```
 
