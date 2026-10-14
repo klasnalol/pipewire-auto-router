@@ -110,6 +110,10 @@ Watch, recreate saved fake devices, and reconnect continuously:
 python3 pipewire_auto_router.py --watch
 ```
 
+Watch mode listens to `pw-dump --monitor` and reacts when PipeWire ports or
+links change. It does not poll the full graph while idle; `interval_seconds` is
+used only as the retry delay if the monitor connection exits.
+
 Preview changes without changing links:
 
 ```sh

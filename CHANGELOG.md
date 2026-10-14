@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Make the headless watcher react to PipeWire graph events instead of polling
+  every two seconds, reducing reconnect latency and idle work.
+
 ## 0.2.0 - 2026-10-09
 
 - Show whether each saved auto-connect link is connected, disconnected, disabled,

@@ -176,6 +176,91 @@ def run_command(args: list[str]) -> str:
     return completed.stdout
 
 
+class PipeWireGraphMonitor:
+    """Wait for graph changes that can make a saved connection actionable."""
+
+    def __init__(self) -> None:
+        self.process = None
+        self.object_types: dict[object, str] = {}
+
+    def __enter__(self) -> "PipeWireGraphMonitor":
+        self.process = subprocess.Popen(
+            ["pw-dump", "--monitor", "--raw", "--no-colors"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+        try:
+            initial_objects = self._read_objects()
+            if initial_objects is None:
+                raise PipeWireCommandError("pw-dump --monitor exited before its initial snapshot")
+            self._update_object_types(initial_objects, detect_changes=False)
+        except BaseException:
+            self.close()
+            raise
+        return self
+
+    def __exit__(self, _exc_type, _exc_value, _traceback) -> None:
+        self.close()
+
+    def close(self) -> None:
+        if self.process is None:
+            return
+        if self.process.poll() is None:
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=1)
+            except subprocess.TimeoutExpired:
+                self.process.kill()
+                self.process.wait()
+        if self.process.stdout is not None:
+            self.process.stdout.close()
+        self.process = None
+
+    def wait_for_change(self) -> bool:
+        """Block until a relevant graph change occurs or the monitor exits."""
+        while True:
+            objects = self._read_objects()
+            if objects is None:
+                return False
+            if self._update_object_types(objects, detect_changes=True):
+                return True
+
+    def _read_objects(self) -> list[dict] | None:
+        if self.process is None or self.process.stdout is None:
+            return None
+        while True:
+            line = self.process.stdout.readline()
+            if line == "":
+                return None
+            try:
+                objects = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(objects, list):
+                return [item for item in objects if isinstance(item, dict)]
+
+    def _update_object_types(self, objects: list[dict], detect_changes: bool) -> bool:
+        changed = False
+        for item in objects:
+            object_id = item.get("id")
+            if object_id is None:
+                continue
+            type_name = item.get("type")
+            if isinstance(type_name, str):
+                previous_type = self.object_types.get(object_id)
+                self.object_types[object_id] = type_name
+                if detect_changes and previous_type is None and type_name.endswith(":Port"):
+                    changed = True
+                continue
+            if item.get("info", object()) is None:
+                previous_type = self.object_types.pop(object_id, "")
+                if detect_changes and previous_type.endswith((":Port", ":Link")):
+                    changed = True
+        return changed
+
+
 def strip_port_id(line: str) -> str:
     return re.sub(r"^\s*\d+\s+", "", line.strip())
 
@@ -538,6 +623,30 @@ def find_qt_gui_launcher() -> Path | None:
     return None
 
 
+def print_watch_messages(messages: list[str]) -> None:
+    visible_messages = [
+        message
+        for message in messages
+        if ": connect " in message or ": disconnect " in message or "failed:" in message
+    ]
+    for message in visible_messages:
+        print(f"{time.strftime('%H:%M:%S')} {message}", flush=True)
+
+
+def watch_config(backend: PipeWireBackend, config: Config, dry_run: bool = False) -> None:
+    """Apply the config initially and whenever PipeWire reports a useful change."""
+    retry_delay = max(config.interval_seconds, 0.5)
+    while True:
+        try:
+            with PipeWireGraphMonitor() as monitor:
+                print_watch_messages(backend.apply_config(config, dry_run=dry_run))
+                while monitor.wait_for_change():
+                    print_watch_messages(backend.apply_config(config, dry_run=dry_run))
+        except (OSError, PipeWireCommandError) as exc:
+            print(f"{time.strftime('%H:%M:%S')} PipeWire monitor failed: {exc}", file=sys.stderr, flush=True)
+        time.sleep(retry_delay)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Reconnect exact PipeWire port connections saved by the Qt patchbay.")
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH, help=f"config file, default {DEFAULT_CONFIG_PATH}")
@@ -557,21 +666,13 @@ def main(argv: list[str] | None = None) -> int:
         if not config.connections and not config.devices:
             print(f"No saved fake devices or auto-reconnect connections in {args.config}")
             return 1
-        while True:
-            messages = backend.apply_config(config, dry_run=args.dry_run)
-            if args.watch:
-                visible_messages = [
-                    message
-                    for message in messages
-                    if ": connect " in message or ": disconnect " in message or "failed:" in message
-                ]
-            else:
-                visible_messages = messages or ["No changes needed"]
-            for message in visible_messages:
-                print(f"{time.strftime('%H:%M:%S')} {message}", flush=True)
-            if not args.watch:
-                return 0
-            time.sleep(max(config.interval_seconds, 0.5))
+        if args.watch:
+            watch_config(backend, config, dry_run=args.dry_run)
+            return 0
+        messages = backend.apply_config(config, dry_run=args.dry_run)
+        for message in messages or ["No changes needed"]:
+            print(f"{time.strftime('%H:%M:%S')} {message}", flush=True)
+        return 0
 
     qt_launcher = find_qt_gui_launcher()
     if not qt_launcher:

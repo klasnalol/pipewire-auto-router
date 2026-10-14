@@ -13,6 +13,7 @@ from pipewire_auto_router import (
     ConnectionRule,
     FakeDevice,
     GraphSnapshot,
+    PipeWireGraphMonitor,
     PipeWireBackend,
     choose_pairs,
     is_valid_device_name,
@@ -20,6 +21,7 @@ from pipewire_auto_router import (
     parse_links,
     parse_port_lines,
     port_channel,
+    watch_config,
 )
 
 
@@ -242,6 +244,42 @@ WEBRTC VoiceEngine:output_FL
 
 
 class MainEntrypointTests(unittest.TestCase):
+    def test_watch_applies_immediately_after_graph_change_without_polling(self):
+        backend = mock.Mock()
+        backend.apply_config.return_value = []
+        config = Config(interval_seconds=2.0, rules=[], connections=[], devices=[])
+        monitor = mock.MagicMock()
+        monitor.__enter__.return_value = monitor
+        monitor.wait_for_change.side_effect = [True, KeyboardInterrupt]
+
+        with mock.patch.object(pipewire_auto_router, "PipeWireGraphMonitor", return_value=monitor), mock.patch.object(
+            pipewire_auto_router.time, "sleep"
+        ) as sleep, self.assertRaises(KeyboardInterrupt):
+            watch_config(backend, config)
+
+        self.assertEqual(backend.apply_config.call_count, 2)
+        sleep.assert_not_called()
+
+    def test_graph_monitor_ignores_client_events_and_wakes_for_new_port(self):
+        process = mock.Mock()
+        process.stdout.readline.side_effect = [
+            '[{"id": 1, "type": "PipeWire:Interface:Client"}]\n',
+            '[{"id": 2, "type": "PipeWire:Interface:Client"}]\n',
+            '[{"id": 3, "type": "PipeWire:Interface:Port"}]\n',
+        ]
+
+        with mock.patch.object(pipewire_auto_router.subprocess, "Popen", return_value=process) as popen:
+            with PipeWireGraphMonitor() as monitor:
+                self.assertTrue(monitor.wait_for_change())
+
+        popen.assert_called_once_with(
+            ["pw-dump", "--monitor", "--raw", "--no-colors"],
+            stdout=pipewire_auto_router.subprocess.PIPE,
+            stderr=pipewire_auto_router.subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+        )
+
     def test_ctrl_c_during_gui_returns_interrupt_status(self):
         with mock.patch.object(pipewire_auto_router, "find_qt_gui_launcher", return_value=ROOT / "run-qt.sh"), mock.patch.object(
             pipewire_auto_router.subprocess, "call", side_effect=KeyboardInterrupt
