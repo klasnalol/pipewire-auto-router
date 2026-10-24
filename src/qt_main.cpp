@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <cerrno>
+#include <sys/file.h>
 
 namespace {
 
@@ -650,90 +652,128 @@ protected:
 
 class MainWindow final : public QMainWindow {
 public:
-    MainWindow() {
+    explicit MainWindow(bool startMonitoring = true) {
         setWindowTitle(QStringLiteral("PipeWire Auto Router"));
-        resize(1280, 820);
+        resize(1280, 850);
 
         auto *central = new QWidget(this);
         auto *layout = new QVBoxLayout(central);
-        layout->setContentsMargins(10, 10, 10, 10);
-        layout->setSpacing(8);
+        layout->setContentsMargins(16, 12, 16, 12);
+        layout->setSpacing(10);
 
-        auto *toolbar = new QHBoxLayout();
-        auto *refreshButton = new QPushButton(QStringLiteral("Refresh"), this);
-        auto *applyButton = new QPushButton(QStringLiteral("Apply auto-reconnect"), this);
-        auto *createDeviceButton = new QPushButton(QStringLiteral("Create Fake Audio"), this);
-        auto *savedButton = new QPushButton(QStringLiteral("Auto-connect Status..."), this);
-        savedButton->setToolTip(QStringLiteral("See which saved links are connected and which devices are available"));
-        m_audioOnly = new QCheckBox(QStringLiteral("Audio only"), this);
-        m_audioOnly->setChecked(true);
-        m_pairChannels = new QCheckBox(QStringLiteral("Connect matching channels"), this);
-        m_pairChannels->setChecked(true);
-        m_autoReconnectNewLinks = new QCheckBox(QStringLiteral("Auto-reconnect new links"), this);
-        m_autoReconnectNewLinks->setChecked(false);
-        m_autoApplyReconnect = new QCheckBox(QStringLiteral("Auto-apply reconnect"), this);
-        m_autoApplyReconnect->setChecked(true);
-        m_liveRefresh = new QCheckBox(QStringLiteral("Live refresh"), this);
-        m_liveRefresh->setChecked(true);
+        auto *header = new QHBoxLayout();
+        auto *title = new QLabel(QStringLiteral("Audio routing"), this);
+        QFont titleFont = title->font();
+        titleFont.setPointSize(titleFont.pointSize() + 5);
+        titleFont.setBold(true);
+        title->setFont(titleFont);
+        header->addWidget(title);
+        header->addStretch();
+        auto *refreshButton = new QPushButton(QStringLiteral("Refresh status"), this);
+        refreshButton->setObjectName(QStringLiteral("refreshStatus"));
+        refreshButton->setToolTip(QStringLiteral("Read the current PipeWire connections and saved rules. This button does not connect anything."));
+        auto *createDeviceButton = new QPushButton(QStringLiteral("Create virtual audio device…"), this);
+        auto *devicesButton = new QPushButton(QStringLiteral("Saved virtual devices…"), this);
+        header->addWidget(refreshButton);
+        header->addWidget(createDeviceButton);
+        header->addWidget(devicesButton);
+        layout->addLayout(header);
 
-        toolbar->addWidget(refreshButton);
-        toolbar->addWidget(applyButton);
-        toolbar->addWidget(createDeviceButton);
-        toolbar->addWidget(savedButton);
-        toolbar->addSpacing(12);
-        toolbar->addWidget(m_audioOnly);
-        toolbar->addWidget(m_pairChannels);
-        toolbar->addWidget(m_autoReconnectNewLinks);
-        toolbar->addWidget(m_autoApplyReconnect);
-        toolbar->addStretch(1);
-        toolbar->addWidget(m_liveRefresh);
-        layout->addLayout(toolbar);
+        m_tabs = new QTabWidget(this);
+        m_tabs->setObjectName(QStringLiteral("routingTabs"));
+        auto *livePage = new QWidget(this);
+        auto *liveLayout = new QVBoxLayout(livePage);
+        liveLayout->setContentsMargins(12, 12, 12, 12);
+        auto *instructions = new QLabel(QStringLiteral("Drag an output port to an input port to connect audio. Right-click a line to disconnect it or change its saved rule."), this);
+        instructions->setWordWrap(true);
+        liveLayout->addWidget(instructions);
+
+        auto *drawing = new QHBoxLayout();
+        drawing->addWidget(new QLabel(QStringLiteral("New connections:"), this));
+        m_connectionLifetime = new QComboBox(this);
+        m_connectionLifetime->setObjectName(QStringLiteral("connectionLifetime"));
+        m_connectionLifetime->addItems({QStringLiteral("Connect once"), QStringLiteral("Save reconnect rule")});
+        m_connectionLifetime->setToolTip(QStringLiteral("Connect once: connect now without saving. Save reconnect rule: also save this route so it returns when the app or device restarts. Applies only to connections you draw next."));
+        drawing->addWidget(m_connectionLifetime);
+        m_channelMode = new QComboBox(this);
+        m_channelMode->setObjectName(QStringLiteral("channelMode"));
+        m_channelMode->addItems({QStringLiteral("Match all audio channels"), QStringLiteral("Only the two dragged ports")});
+        m_channelMode->setToolTip(QStringLiteral("Match all audio channels connects matching left, right and other channels between the two devices. Only the two dragged ports creates exactly one link."));
+        drawing->addWidget(m_channelMode);
+        drawing->addStretch();
+        drawing->addWidget(new QLabel(QStringLiteral("Show:"), this));
+        m_portFilter = new QComboBox(this);
+        m_portFilter->setObjectName(QStringLiteral("portFilter"));
+        m_portFilter->addItems({QStringLiteral("Audio ports"), QStringLiteral("All ports")});
+        m_portFilter->setToolTip(QStringLiteral("Changes which ports are visible. Hidden connections keep working."));
+        drawing->addWidget(m_portFilter);
+        liveLayout->addLayout(drawing);
+        m_drawingHelp = new QLabel(this);
+        m_drawingHelp->setWordWrap(true);
+        liveLayout->addWidget(m_drawingHelp);
+        auto updateDrawingHelp = [this] {
+            const QString lifetime = m_connectionLifetime->currentIndex() == 0
+                ? QStringLiteral("Connect once: new links are not saved.")
+                : QStringLiteral("Save reconnect rule: new supported routes are saved and restored automatically.");
+            const QString channels = m_channelMode->currentIndex() == 0
+                ? QStringLiteral("Matching channels connects left → left and right → right together.")
+                : QStringLiteral("Only the two dragged ports will connect; other channels are unchanged.");
+            m_drawingHelp->setText(lifetime + QLatin1Char(' ') + channels);
+        };
+        m_drawingHelp->setObjectName(QStringLiteral("drawingHelp"));
+        updateDrawingHelp();
+        connect(m_connectionLifetime, &QComboBox::currentIndexChanged, this, updateDrawingHelp);
+        connect(m_channelMode, &QComboBox::currentIndexChanged, this, updateDrawingHelp);
 
         m_scene = new QGraphicsScene(this);
         m_scene->setBackgroundBrush(QColor(QStringLiteral("#eef1f3")));
         m_view = new PatchbayView(this);
+        m_view->setObjectName(QStringLiteral("livePatchbay"));
         m_view->setScene(m_scene);
-        layout->addWidget(m_view, 1);
+        liveLayout->addWidget(m_view, 1);
+        auto *legend = new QLabel(QStringLiteral("Orange line: saved reconnect rule     Blue line: live connection     Status refreshes automatically"), this);
+        legend->setWordWrap(true);
+        liveLayout->addWidget(legend);
+        m_tabs->addTab(livePage, QStringLiteral("Live connections"));
+        m_tabs->addTab(createSavedRulesPage(), QStringLiteral("Saved reconnect rules"));
+        layout->addWidget(m_tabs, 1);
 
+        auto *activity = new QGroupBox(QStringLiteral("Activity"), this);
+        auto *activityLayout = new QVBoxLayout(activity);
         m_log = new QPlainTextEdit(this);
+        m_log->setObjectName(QStringLiteral("activityLog"));
         m_log->setReadOnly(true);
         m_log->setMaximumBlockCount(300);
-        m_log->setFixedHeight(118);
-        layout->addWidget(m_log);
-
+        m_log->setFixedHeight(88);
+        activityLayout->addWidget(m_log);
+        layout->addWidget(activity);
         setCentralWidget(central);
         statusBar()->showMessage(QStringLiteral("Ready"));
 
         connect(refreshButton, &QPushButton::clicked, this, [this] { refreshGraph(true); });
-        connect(applyButton, &QPushButton::clicked, this, [this] { applySavedConnections(false); });
         connect(createDeviceButton, &QPushButton::clicked, this, [this] { showCreateFakeAudioDialog(); });
-        connect(savedButton, &QPushButton::clicked, this, [this] { showSavedDialog(); });
-        connect(m_audioOnly, &QCheckBox::toggled, this, [this] { rebuildScene(); });
+        connect(devicesButton, &QPushButton::clicked, this, [this] { showSavedDevicesDialog(); });
+        connect(m_portFilter, &QComboBox::currentIndexChanged, this, [this] { rebuildScene(); });
 
         m_view->onPress = [this](const QPointF &pos, Qt::MouseButton button, const QPoint &globalPos) {
             return handlePress(pos, button, globalPos);
         };
-        m_view->onMove = [this](const QPointF &pos) {
-            return handleMove(pos);
-        };
-        m_view->onRelease = [this](const QPointF &pos, Qt::MouseButton button) {
-            return handleRelease(pos, button);
-        };
-        m_view->onSceneChanged = [this] {
-            updateLinkPaths();
-        };
+        m_view->onMove = [this](const QPointF &pos) { return handleMove(pos); };
+        m_view->onRelease = [this](const QPointF &pos, Qt::MouseButton button) { return handleRelease(pos, button); };
+        m_view->onSceneChanged = [this] { updateLinkPaths(); };
 
         connect(&m_refreshTimer, &QTimer::timeout, this, [this] {
-            if (m_dragPort.isEmpty() && m_autoApplyReconnect->isChecked()) {
+            if (m_dragPort.isEmpty() && !QApplication::activeModalWidget()) {
                 applySavedConnections(true);
-                return;
-            }
-            if (m_dragPort.isEmpty() && m_liveRefresh->isChecked()) {
-                refreshGraph(false);
             }
         });
-        m_refreshTimer.start(2500);
-        refreshGraph(true);
+        if (startMonitoring) {
+            m_refreshTimer.start(2500);
+            refreshGraph(true);
+        } else {
+            loadAutoConnections();
+            populateSavedRules();
+        }
     }
 
 private:
@@ -747,6 +787,7 @@ private:
         m_graph = snapshot.graph;
         loadAutoConnections();
         rebuildScene();
+        populateSavedRules();
         int connectedAutomatically = 0;
         for (const QString &key : std::as_const(m_autoConnections)) {
             if (m_graph.links.contains(key)) {
@@ -785,13 +826,13 @@ private:
             QStringList outputs;
             for (const QString &alias : node.inputs) {
                 const PortInfo port = m_graph.ports.value(alias);
-                if (!m_audioOnly->isChecked() || port.audio) {
+                if (m_portFilter->currentIndex() != 0 || port.audio) {
                     inputs << alias;
                 }
             }
             for (const QString &alias : node.outputs) {
                 const PortInfo port = m_graph.ports.value(alias);
-                if (!m_audioOnly->isChecked() || port.audio) {
+                if (m_portFilter->currentIndex() != 0 || port.audio) {
                     outputs << alias;
                 }
             }
@@ -831,14 +872,12 @@ private:
             const auto [output, input] = splitLinkKey(key);
             if (m_anchors.contains(output) && m_anchors.contains(input)) {
                 const bool autoReconnect = m_autoConnections.contains(key);
-                const bool madeThisSession = m_sessionLinks.contains(key);
                 addLinkPath(
                     output,
                     input,
                     autoReconnect ? QColor(QStringLiteral("#d47424"))
-                                  : madeThisSession ? QColor(QStringLiteral("#1f9d73"))
-                                                    : QColor(QStringLiteral("#496c9d")),
-                    autoReconnect ? 3.2 : madeThisSession ? 2.8 : 2.2,
+                                  : QColor(QStringLiteral("#496c9d")),
+                    autoReconnect ? 3.2 : 2.2,
                     Qt::SolidLine);
             }
         }
@@ -859,12 +898,12 @@ private:
         m_anchors.clear();
         for (NodeItem *item : std::as_const(m_items)) {
             for (const QString &alias : m_graph.nodes.value(item->nodeName()).inputs) {
-                if ((!m_audioOnly->isChecked() || m_graph.ports.value(alias).audio) && !item->anchorFor(alias).isNull()) {
+                if ((m_portFilter->currentIndex() != 0 || m_graph.ports.value(alias).audio) && !item->anchorFor(alias).isNull()) {
                     m_anchors.insert(alias, item->anchorFor(alias));
                 }
             }
             for (const QString &alias : m_graph.nodes.value(item->nodeName()).outputs) {
-                if ((!m_audioOnly->isChecked() || m_graph.ports.value(alias).audio) && !item->anchorFor(alias).isNull()) {
+                if ((m_portFilter->currentIndex() != 0 || m_graph.ports.value(alias).audio) && !item->anchorFor(alias).isNull()) {
                     m_anchors.insert(alias, item->anchorFor(alias));
                 }
             }
@@ -930,6 +969,9 @@ private:
         item->setData(kLinkItemRole, QStringLiteral("link"));
         item->setData(kLinkOutputRole, output);
         item->setData(kLinkInputRole, input);
+        item->setToolTip(connectionName(output, input) + (m_autoConnections.contains(linkKey(output, input))
+            ? QStringLiteral("\nSaved reconnect rule: this route is restored automatically. Right-click to remove it and disconnect.")
+            : QStringLiteral("\nLive connection without an enabled saved rule. Right-click for actions.")));
         item->setFlag(QGraphicsItem::ItemIsSelectable, true);
         m_linkItems.insert(linkKey(output, input), item);
     }
@@ -966,9 +1008,10 @@ private:
         const PortHit hit = findPort(scenePos);
         if (button == Qt::RightButton && hit.valid) {
             QMenu menu;
-            QAction *disconnect = menu.addAction(QStringLiteral("Disconnect port links"));
-            QAction *chosen = menu.exec(globalPos);
-            if (chosen == disconnect) {
+            menu.setToolTipsVisible(true);
+            QAction *disconnect = menu.addAction(QStringLiteral("Disconnect all links on this port & remove their saved rules"));
+            disconnect->setToolTip(QStringLiteral("Applies only to %1. Other channels use separate ports.").arg(hit.alias));
+            if (menu.exec(globalPos) == disconnect) {
                 disconnectPortLinks(hit.alias);
             }
             return true;
@@ -978,28 +1021,47 @@ private:
             if (!output.isEmpty() && !input.isEmpty()) {
                 QMenu menu;
                 const QString key = linkKey(output, input);
-                const bool autoReconnect = m_autoConnections.contains(key);
-                const bool madeThisSession = m_sessionLinks.contains(key);
-                const bool supportedAutoConnection = isSupportedAutoConnection(output, input);
-                QAction *toggleAuto = nullptr;
-                if (autoReconnect) {
-                    toggleAuto = menu.addAction(QStringLiteral("Disable auto-reconnect for this connection"));
-                } else if (madeThisSession && supportedAutoConnection) {
-                    toggleAuto = menu.addAction(QStringLiteral("Enable auto-reconnect for this connection"));
-                } else if (!supportedAutoConnection) {
-                    QAction *unsupported = menu.addAction(QStringLiteral("Auto-reconnect supports output/monitor -> playback"));
-                    unsupported->setEnabled(false);
-                } else {
-                    QAction *notSessionLink = menu.addAction(QStringLiteral("Auto-reconnect is only for links made in this session"));
-                    notSessionLink->setEnabled(false);
+                const QSet<QString> route = routeLinks(output, input);
+                const QSet<QString> saved = savedConnectionKeys();
+                bool hasSavedRule = false;
+                for (const QString &candidate : route) {
+                    hasSavedRule = hasSavedRule || saved.contains(candidate);
                 }
-                QAction *disconnect = menu.addAction(QStringLiteral("Disconnect this connection"));
-                QAction *chosen = menu.exec(globalPos);
-                if (toggleAuto && chosen == toggleAuto) {
-                    setAutoReconnect(output, input, !autoReconnect);
-                } else if (chosen == disconnect) {
-                    disconnectOne(output, input);
+                const QString count = route.size() > 1 ? QStringLiteral(" (%1 channels)").arg(route.size()) : QString();
+                QAction *disconnectRoute = menu.addAction(QStringLiteral("Disconnect route & remove saved rules") + count);
+                QAction *disconnectChannel = route.size() > 1
+                    ? menu.addAction(QStringLiteral("Disconnect only %1 → %2 & remove its rule").arg(leafFromAlias(output), leafFromAlias(input))) : nullptr;
+                menu.addSeparator();
+                QAction *remember = nullptr;
+                QAction *forget = nullptr;
+                if (hasSavedRule) {
+                    forget = menu.addAction(QStringLiteral("Forget route rules (keep connected)") + count);
+                }
+                if (isSupportedAutoConnection(output, input)) {
+                    remember = menu.addAction(QStringLiteral("Save reconnect rule for this route") + count);
+                } else {
+                    QAction *unsupported = menu.addAction(QStringLiteral("Saving supported for app/monitor outputs → playback inputs"));
+                    unsupported->setEnabled(false);
+                }
+                const QAction *chosen = menu.exec(globalPos);
+                if (chosen == disconnectRoute) {
+                    removeAndDisconnect(route);
                     refreshGraph(false);
+                } else if (disconnectChannel && chosen == disconnectChannel) {
+                    removeAndDisconnect({key});
+                    refreshGraph(false);
+                } else if (forget && chosen == forget) {
+                    if (removeReconnectEntries(route)) {
+                        appendLog(QStringLiteral("Forgot route rules; current audio connections were kept"));
+                        rebuildScene();
+                        populateSavedRules();
+                    }
+                } else if (remember && chosen == remember) {
+                    QList<QPair<QString, QString>> pairs;
+                    for (const QString &candidate : route) {
+                        pairs << splitLinkKey(candidate);
+                    }
+                    saveAutoReconnectForPairs(pairs);
                 }
                 return true;
             }
@@ -1068,7 +1130,7 @@ private:
         const QString sourceKind = outputKindForPort(output);
         const QString targetKind = inputKindForPort(input);
         QList<QPair<QString, QString>> pairs;
-        if (m_pairChannels->isChecked()) {
+        if (m_channelMode->currentIndex() == 0) {
             pairs = matchingPairs(outputPort.nodeName, inputPort.nodeName, sourceKind, targetKind, output, input);
         } else {
             pairs << qMakePair(output, input);
@@ -1079,23 +1141,33 @@ private:
             appendLog(QStringLiteral("Connection cancelled"));
             return;
         }
+        QSet<QString> replacedLinks;
         for (const auto &pair : linksToDisconnect) {
-            disconnectOne(pair.first, pair.second);
+            replacedLinks.insert(linkKey(pair.first, pair.second));
+        }
+        const bool saveRoute = m_connectionLifetime->currentIndex() == 1;
+        if (saveRoute && !saveAutoReconnectForPairs(pairs, replacedLinks)) {
+            appendLog(QStringLiteral("Connection cancelled because the reconnect rule could not be saved"));
+            return;
+        }
+        if (!saveRoute && !replacedLinks.isEmpty() && !removeReconnectEntries(replacedLinks)) {
+            appendLog(QStringLiteral("Connection cancelled because the previous saved route could not be removed"));
+            return;
+        }
+        for (const auto &pair : linksToDisconnect) {
+            if (!disconnectOne(pair.first, pair.second)) {
+                appendLog(QStringLiteral("Some previous links could not be disconnected; see errors above"));
+            }
         }
 
         int changed = 0;
-        QList<QPair<QString, QString>> createdPairs;
         for (const auto &pair : pairs) {
             if (connectOne(pair.first, pair.second)) {
                 ++changed;
-                createdPairs << pair;
                 m_sessionLinks.insert(linkKey(pair.first, pair.second));
             }
         }
 
-        if (m_autoReconnectNewLinks->isChecked() && !createdPairs.isEmpty()) {
-            saveAutoReconnectForPairs(createdPairs);
-        }
         appendLog(QStringLiteral("Connected %1 channel%2 from %3 to %4")
                       .arg(changed)
                       .arg(changed == 1 ? QString() : QStringLiteral("s"))
@@ -1170,23 +1242,22 @@ private:
         }
 
         QDialog dialog(this);
-        dialog.setWindowTitle(QStringLiteral("Choose Links To Disconnect"));
+        dialog.setWindowTitle(QStringLiteral("Add or move audio?"));
         auto *layout = new QVBoxLayout(&dialog);
-        auto *label = new QLabel(QStringLiteral("These source ports already have other links. Check only the links you want to disconnect."), &dialog);
+        auto *label = new QLabel(QStringLiteral("These source channels already send audio to the destinations below. Add keeps them playing; move disconnects all listed links and removes their saved rules before connecting the new destination."), &dialog);
         label->setWordWrap(true);
         layout->addWidget(label);
 
         auto *list = new QListWidget(&dialog);
         for (const auto &candidate : candidates) {
             auto *item = new QListWidgetItem(connectionName(candidate.first, candidate.second), list);
-            item->setCheckState(Qt::Unchecked);
-            item->setData(Qt::UserRole, linkKey(candidate.first, candidate.second));
+            item->setToolTip(connectionName(candidate.first, candidate.second));
         }
         layout->addWidget(list);
 
         auto *buttons = new QDialogButtonBox(&dialog);
-        auto *keepButton = buttons->addButton(QStringLiteral("Keep all and connect"), QDialogButtonBox::AcceptRole);
-        auto *disconnectButton = buttons->addButton(QStringLiteral("Disconnect checked and connect"), QDialogButtonBox::AcceptRole);
+        auto *keepButton = buttons->addButton(QStringLiteral("Add destination (keep existing)"), QDialogButtonBox::AcceptRole);
+        auto *disconnectButton = buttons->addButton(QStringLiteral("Move audio (disconnect listed)"), QDialogButtonBox::AcceptRole);
         buttons->addButton(QDialogButtonBox::Cancel);
         int mode = 0;
         connect(keepButton, &QPushButton::clicked, &dialog, [&] {
@@ -1207,13 +1278,7 @@ private:
             return true;
         }
 
-        for (int i = 0; i < list->count(); ++i) {
-            const QListWidgetItem *item = list->item(i);
-            if (item->checkState() != Qt::Checked) {
-                continue;
-            }
-            selected->append(splitLinkKey(item->data(Qt::UserRole).toString()));
-        }
+        *selected = candidates;
         return true;
     }
 
@@ -1221,7 +1286,7 @@ private:
         if (m_graph.links.contains(linkKey(output, input))) {
             return false;
         }
-        const CommandResult result = runCommand(QStringLiteral("pw-link"), {QStringLiteral("-L"), QStringLiteral("-w"), output, input});
+        const CommandResult result = runCommand(QStringLiteral("pw-link"), {QStringLiteral("-L"), output, input});
         if (!result.ok) {
             appendLog(QStringLiteral("Connect failed: %1").arg(result.error));
             return false;
@@ -1238,23 +1303,21 @@ private:
         }
         m_graph.links.remove(linkKey(output, input));
         m_sessionLinks.remove(linkKey(output, input));
-        removeAutoReconnectEntry(output, input, true);
         return true;
     }
 
     void disconnectPortLinks(const QString &alias) {
-        int count = 0;
-        const QStringList links = QStringList(m_graph.links.begin(), m_graph.links.end());
-        for (const QString &key : links) {
+        QSet<QString> keys;
+        const QSet<QString> candidates = m_graph.links | savedConnectionKeys();
+        for (const QString &key : candidates) {
             const auto [output, input] = splitLinkKey(key);
             if (output == alias || input == alias) {
-                if (disconnectOne(output, input)) {
-                    ++count;
-                }
+                keys.insert(key);
             }
         }
-        appendLog(QStringLiteral("Disconnected %1 link%2 for %3").arg(count).arg(count == 1 ? QString() : QStringLiteral("s")).arg(alias));
-        refreshGraph(false);
+        if (removeAndDisconnect(keys)) {
+            refreshGraph(false);
+        }
     }
 
     QString displayForNode(const QString &nodeName) const {
@@ -1262,50 +1325,84 @@ private:
         return node.displayName.isEmpty() ? nodeName : node.displayName;
     }
 
-    QJsonObject loadConfigRoot() const {
+    QJsonObject loadConfigRoot(bool *ok = nullptr) const {
+        if (ok) {
+            *ok = false;
+        }
+        m_configReadError.clear();
         const QString path = configPath();
         QFile file(path);
         QJsonObject root;
-        if (file.exists() && file.open(QIODevice::ReadOnly)) {
+        if (file.exists()) {
+            if (!file.open(QIODevice::ReadOnly)) {
+                m_configReadError = QStringLiteral("Could not read saved rules: %1").arg(file.errorString());
+                return {};
+            }
             QJsonParseError error;
             const QJsonDocument document = QJsonDocument::fromJson(file.readAll(), &error);
-            if (error.error == QJsonParseError::NoError) {
-                if (document.isObject()) {
-                    root = document.object();
-                } else if (document.isArray()) {
-                    root.insert(QStringLiteral("rules"), document.array());
-                }
+            if (error.error != QJsonParseError::NoError || (!document.isObject() && !document.isArray())) {
+                m_configReadError = QStringLiteral("Could not read saved rules: %1").arg(error.error == QJsonParseError::NoError
+                    ? QStringLiteral("the configuration must be an object or array") : error.errorString());
+                return {};
             }
-            file.close();
+            if (document.isObject()) {
+                root = document.object();
+            } else {
+                root.insert(QStringLiteral("rules"), document.array());
+            }
         }
         if (!root.contains(QStringLiteral("interval_seconds"))) {
             root.insert(QStringLiteral("interval_seconds"), 2.0);
         }
-        if (!root.contains(QStringLiteral("rules"))) {
-            root.insert(QStringLiteral("rules"), QJsonArray());
+        for (const QString &key : {QStringLiteral("rules"), QStringLiteral("connections"), QStringLiteral("devices")}) {
+            if (root.contains(key) && !root.value(key).isArray()) {
+                m_configReadError = QStringLiteral("Could not read saved rules: '%1' must be an array").arg(key);
+                return {};
+            }
+            if (!root.contains(key)) {
+                root.insert(key, QJsonArray());
+            }
         }
-        if (!root.contains(QStringLiteral("connections"))) {
-            root.insert(QStringLiteral("connections"), QJsonArray());
-        }
-        if (!root.contains(QStringLiteral("devices"))) {
-            root.insert(QStringLiteral("devices"), QJsonArray());
+        if (ok) {
+            *ok = true;
         }
         return root;
+    }
+
+    bool readConfigForEdit(QJsonObject *root) {
+        bool ok = false;
+        *root = loadConfigRoot(&ok);
+        if (!ok) {
+            appendLog(m_configReadError + QStringLiteral(". No changes were made."));
+            statusBar()->showMessage(m_configReadError);
+        }
+        return ok;
     }
 
     bool writeConfigRoot(const QJsonObject &root) {
         const QString path = configPath();
         QDir().mkpath(QFileInfo(path).absolutePath());
-        QFile out(path + QStringLiteral(".tmp"));
-        if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-            appendLog(QStringLiteral("Could not write %1").arg(path));
+        QFile lockFile(path + QStringLiteral(".lock"));
+        if (!lockFile.open(QIODevice::ReadWrite)) {
+            appendLog(QStringLiteral("Could not lock saved rules: %1. No changes were made.").arg(lockFile.errorString()));
             return false;
         }
-        out.write(QJsonDocument(root).toJson(QJsonDocument::Indented));
-        out.close();
-        QFile::remove(path);
-        if (!QFile::rename(out.fileName(), path)) {
-            appendLog(QStringLiteral("Could not replace %1").arg(path));
+        QElapsedTimer lockTimer;
+        lockTimer.start();
+        while (::flock(lockFile.handle(), LOCK_EX | LOCK_NB) != 0) {
+            if ((errno != EWOULDBLOCK && errno != EAGAIN && errno != EINTR) || lockTimer.elapsed() >= 3000) {
+                appendLog(QStringLiteral("Saved rules are busy; try again. Existing connections were kept."));
+                statusBar()->showMessage(QStringLiteral("Could not save rules: background router is busy"));
+                return false;
+            }
+            QThread::msleep(20);
+        }
+        QSaveFile out(path);
+        const QByteArray data = QJsonDocument(root).toJson(QJsonDocument::Indented);
+        if (!out.open(QIODevice::WriteOnly) || out.write(data) != data.size() || !out.commit()) {
+            const QString error = QStringLiteral("Could not save %1: %2. Existing connections were kept.").arg(path, out.errorString());
+            appendLog(error);
+            statusBar()->showMessage(error);
             return false;
         }
         return true;
@@ -1353,7 +1450,10 @@ private:
     }
 
     bool saveFakeAudioDevice(const QString &name, const QString &description, int channels) {
-        QJsonObject root = loadConfigRoot();
+        QJsonObject root;
+        if (!readConfigForEdit(&root)) {
+            return false;
+        }
         QJsonArray devices = root.value(QStringLiteral("devices")).toArray();
         QJsonArray updated;
         bool replaced = false;
@@ -1391,7 +1491,10 @@ private:
     }
 
     void removeFakeAudioDeviceEntry(const QString &name) {
-        QJsonObject root = loadConfigRoot();
+        QJsonObject root;
+        if (!readConfigForEdit(&root)) {
+            return;
+        }
         const QJsonArray devices = root.value(QStringLiteral("devices")).toArray();
         QJsonArray updated;
         for (const QJsonValue &value : devices) {
@@ -1409,7 +1512,7 @@ private:
 
     void showCreateFakeAudioDialog() {
         QDialog dialog(this);
-        dialog.setWindowTitle(QStringLiteral("Create Fake Audio"));
+        dialog.setWindowTitle(QStringLiteral("Create virtual audio device"));
         auto *layout = new QFormLayout(&dialog);
 
         auto *nameEdit = new QLineEdit(&dialog);
@@ -1419,7 +1522,8 @@ private:
         auto *channels = new QSpinBox(&dialog);
         channels->setRange(1, 8);
         channels->setValue(2);
-        auto *saveDevice = new QCheckBox(QStringLiteral("Save and recreate automatically"), &dialog);
+        auto *saveDevice = new QCheckBox(QStringLiteral("Recreate this device automatically after a restart"), &dialog);
+        saveDevice->setToolTip(QStringLiteral("Saves the device definition. The app or background router recreates it when it is missing. This does not save any audio connections."));
         saveDevice->setChecked(true);
 
         layout->addRow(QStringLiteral("Name"), nameEdit);
@@ -1451,137 +1555,281 @@ private:
         refreshGraph(true);
     }
 
-    void showSavedDialog() {
-        QDialog dialog(this);
-        dialog.setWindowTitle(QStringLiteral("Auto-connect Status"));
-        dialog.resize(900, 500);
-        auto *layout = new QVBoxLayout(&dialog);
-        auto *summary = new QLabel(&dialog);
-        summary->setWordWrap(true);
-        layout->addWidget(summary);
-        auto *tabs = new QTabWidget(&dialog);
-        auto *connectionsList = new QListWidget(&dialog);
-        auto *devicesList = new QListWidget(&dialog);
+    QString routeKey(const QString &output, const QString &input) const {
+        return nodeFromAlias(output) + QLatin1Char('\n') + nodeFromAlias(input)
+            + QLatin1Char('\n') + outputKindForPort(output) + QLatin1Char('\n') + inputKindForPort(input);
+    }
 
-        auto populate = [&] {
-            connectionsList->clear();
-            devicesList->clear();
-            const QJsonObject root = loadConfigRoot();
-            int enabledConnections = 0;
-            int connectedConnections = 0;
-            for (const QJsonValue &value : root.value(QStringLiteral("connections")).toArray()) {
-                const QJsonObject connection = value.toObject();
-                const QString output = connection.value(QStringLiteral("output")).toString();
-                const QString input = connection.value(QStringLiteral("input")).toString();
-                const bool enabled = connection.value(QStringLiteral("enabled")).toBool(true);
-                const QString key = linkKey(output, input);
-                QString state;
-                QString detail;
-                QColor color;
-                if (!enabled) {
-                    state = QStringLiteral("Disabled");
-                    detail = QStringLiteral("This saved connection is disabled");
-                    color = QColor(QStringLiteral("#777777"));
-                } else if (m_graph.links.contains(key)) {
-                    state = QStringLiteral("Connected");
-                    detail = QStringLiteral("This auto-connect link is active now");
-                    color = QColor(QStringLiteral("#238636"));
-                    ++enabledConnections;
-                    ++connectedConnections;
-                } else {
-                    ++enabledConnections;
-                    const bool outputPresent = m_graph.outputs.contains(output);
-                    const bool inputPresent = m_graph.inputs.contains(input);
-                    if (!outputPresent && !inputPresent) {
-                        state = QStringLiteral("Waiting - both devices are offline");
-                    } else if (!outputPresent) {
-                        state = QStringLiteral("Waiting - source is offline");
-                    } else if (!inputPresent) {
-                        state = QStringLiteral("Waiting - destination is offline");
-                    } else {
-                        state = QStringLiteral("Disconnected - ready to reconnect");
-                    }
-                    detail = QStringLiteral("The rule is saved and will connect when both ports are available");
-                    color = QColor(QStringLiteral("#b26a00"));
-                }
-                auto *item = new QListWidgetItem(QStringLiteral("%1  |  %2").arg(state, connectionName(output, input)), connectionsList);
-                item->setData(Qt::UserRole, linkKey(output, input));
-                item->setForeground(color);
-                item->setToolTip(detail);
+    QSet<QString> savedConnectionKeys() const {
+        QSet<QString> keys;
+        const QJsonObject root = loadConfigRoot();
+        for (const QJsonValue &value : root.value(QStringLiteral("connections")).toArray()) {
+            const QJsonObject entry = value.toObject();
+            const QString output = entry.value(QStringLiteral("output")).toString();
+            const QString input = entry.value(QStringLiteral("input")).toString();
+            if (!output.isEmpty() && !input.isEmpty()) {
+                keys.insert(linkKey(output, input));
             }
+        }
+        return keys;
+    }
+
+    QSet<QString> routeLinks(const QString &output, const QString &input) const {
+        QSet<QString> result;
+        const QString group = routeKey(output, input);
+        const QSet<QString> candidates = m_graph.links | savedConnectionKeys();
+        for (const QString &key : candidates) {
+            const auto [candidateOutput, candidateInput] = splitLinkKey(key);
+            if (routeKey(candidateOutput, candidateInput) == group) {
+                result.insert(key);
+            }
+        }
+        return result;
+    }
+
+    QSet<QString> selectedRuleKeys() const {
+        QSet<QString> keys;
+        if (const QTreeWidgetItem *item = m_savedRules->currentItem()) {
+            const QStringList stored = item->data(0, Qt::UserRole).toStringList();
+            for (const QString &key : stored) {
+                keys.insert(key);
+            }
+        }
+        return keys;
+    }
+
+    void updateSelectedRuleHelp() {
+        const QSet<QString> keys = selectedRuleKeys();
+        const bool selected = !keys.isEmpty();
+        m_removeRuleButton->setEnabled(selected);
+        m_forgetRuleButton->setEnabled(selected);
+        m_removeRuleButton->setText(keys.size() > 1
+            ? QStringLiteral("Remove route & disconnect (%1 channels)").arg(keys.size())
+            : QStringLiteral("Remove rule & disconnect"));
+        m_forgetRuleButton->setText(keys.size() > 1
+            ? QStringLiteral("Forget route (keep live audio)")
+            : QStringLiteral("Forget rule (keep connected)"));
+        if (!selected) {
+            m_selectedRuleHelp->setText(QStringLiteral("Select a route to manage all its channels, or expand it to select one channel. Removing a rule stops this router from restoring it."));
+            return;
+        }
+        QStringList channels;
+        for (const QString &key : keys) {
+            const auto [output, input] = splitLinkKey(key);
+            channels << leafFromAlias(output) + QStringLiteral(" → ") + leafFromAlias(input);
+        }
+        channels.sort();
+        m_selectedRuleHelp->setText(QStringLiteral("Selected: %1. Remove disconnects these channels now and deletes their saved rules. Forget deletes their rules and leaves current audio playing.").arg(channels.join(QStringLiteral(", "))));
+    }
+
+    QWidget *createSavedRulesPage() {
+        auto *page = new QWidget(this);
+        auto *layout = new QVBoxLayout(page);
+        layout->setContentsMargins(12, 12, 12, 12);
+        auto *help = new QLabel(QStringLiteral("Saved rules restore audio connections automatically while this app is open or the background service is running. Closing this app does not stop the background service. A live connection can remain after its rule is forgotten."), page);
+        help->setWordWrap(true);
+        layout->addWidget(help);
+        m_savedSummary = new QLabel(page);
+        m_savedSummary->setObjectName(QStringLiteral("savedRulesSummary"));
+        m_savedSummary->setWordWrap(true);
+        layout->addWidget(m_savedSummary);
+        m_savedRules = new QTreeWidget(page);
+        m_savedRules->setObjectName(QStringLiteral("savedRules"));
+        m_savedRules->setHeaderLabels({QStringLiteral("Source"), QStringLiteral("Destination"), QStringLiteral("Reconnect"), QStringLiteral("Live status"), QStringLiteral("Channels")});
+        m_savedRules->setAlternatingRowColors(true);
+        m_savedRules->setSelectionMode(QAbstractItemView::SingleSelection);
+        m_savedRules->setRootIsDecorated(true);
+        m_savedRules->header()->setSectionResizeMode(0, QHeaderView::Stretch);
+        m_savedRules->header()->setSectionResizeMode(1, QHeaderView::Stretch);
+        for (int column = 2; column < 5; ++column) {
+            m_savedRules->header()->setSectionResizeMode(column, QHeaderView::ResizeToContents);
+        }
+        layout->addWidget(m_savedRules, 1);
+        m_selectedRuleHelp = new QLabel(page);
+        m_selectedRuleHelp->setWordWrap(true);
+        m_selectedRuleHelp->setMinimumHeight(42);
+        layout->addWidget(m_selectedRuleHelp);
+        auto *actions = new QHBoxLayout();
+        m_removeRuleButton = new QPushButton(QStringLiteral("Remove rule & disconnect"), page);
+        m_removeRuleButton->setObjectName(QStringLiteral("removeRuleAndDisconnect"));
+        m_removeRuleButton->setToolTip(QStringLiteral("Save removal of the selected rule first, then disconnect its live channels. If saving fails, audio stays connected."));
+        m_forgetRuleButton = new QPushButton(QStringLiteral("Forget rule (keep connected)"), page);
+        m_forgetRuleButton->setObjectName(QStringLiteral("forgetRule"));
+        m_forgetRuleButton->setToolTip(QStringLiteral("Delete the selected saved rule without disconnecting its live audio. The router will no longer restore it."));
+        auto *reconnect = new QPushButton(QStringLiteral("Reconnect saved now"), page);
+        reconnect->setObjectName(QStringLiteral("reconnectSavedNow"));
+        reconnect->setToolTip(QStringLiteral("Try all enabled saved rules once. Does not save any additional connections. Offline devices stay waiting."));
+        actions->addWidget(m_removeRuleButton);
+        actions->addWidget(m_forgetRuleButton);
+        actions->addStretch();
+        actions->addWidget(reconnect);
+        layout->addLayout(actions);
+        connect(m_savedRules, &QTreeWidget::itemSelectionChanged, this, [this] { updateSelectedRuleHelp(); });
+        connect(m_removeRuleButton, &QPushButton::clicked, this, [this] {
+            const QSet<QString> keys = selectedRuleKeys();
+            if (!keys.isEmpty() && removeAndDisconnect(keys)) {
+                refreshGraph(false);
+            }
+            populateSavedRules();
+            rebuildScene();
+        });
+        connect(m_forgetRuleButton, &QPushButton::clicked, this, [this] {
+            const QSet<QString> keys = selectedRuleKeys();
+            if (!keys.isEmpty() && removeReconnectEntries(keys)) {
+                appendLog(QStringLiteral("Forgot selected reconnect rule; current audio connections were kept"));
+                populateSavedRules();
+                rebuildScene();
+            }
+        });
+        connect(reconnect, &QPushButton::clicked, this, [this] { applySavedConnections(false); });
+        updateSelectedRuleHelp();
+        return page;
+    }
+
+    void populateSavedRules() {
+        const QSet<QString> selected = selectedRuleKeys();
+        QSet<QString> expanded;
+        for (int i = 0; i < m_savedRules->topLevelItemCount(); ++i) {
+            const auto *item = m_savedRules->topLevelItem(i);
+            if (item->isExpanded()) {
+                expanded.insert(item->data(0, Qt::UserRole + 1).toString());
+            }
+        }
+        const QSignalBlocker blocker(m_savedRules);
+        m_savedRules->clear();
+        bool ok = false;
+        const QJsonObject root = loadConfigRoot(&ok);
+        if (!ok) {
+            m_savedSummary->setText(m_configReadError + QStringLiteral(". The saved configuration has been kept."));
+            updateSelectedRuleHelp();
+            return;
+        }
+        QMap<QString, QList<QJsonObject>> routes;
+        int enabledCount = 0;
+        int activeCount = 0;
+        for (const QJsonValue &value : root.value(QStringLiteral("connections")).toArray()) {
+            const QJsonObject entry = value.toObject();
+            const QString output = entry.value(QStringLiteral("output")).toString();
+            const QString input = entry.value(QStringLiteral("input")).toString();
+            routes[routeKey(output, input)].append(entry);
+        }
+        for (auto it = routes.cbegin(); it != routes.cend(); ++it) {
+            const QList<QJsonObject> entries = it.value();
+            const QString firstOutput = entries.first().value(QStringLiteral("output")).toString();
+            const QString firstInput = entries.first().value(QStringLiteral("input")).toString();
+            auto *route = new QTreeWidgetItem(m_savedRules);
+            route->setText(0, displayForNode(nodeFromAlias(firstOutput)));
+            route->setText(1, displayForNode(nodeFromAlias(firstInput)));
+            QStringList keys;
+            int enabled = 0;
+            int active = 0;
+            bool waiting = false;
+            QStringList allAliases;
+            for (const QJsonObject &entry : entries) {
+                const QString output = entry.value(QStringLiteral("output")).toString();
+                const QString input = entry.value(QStringLiteral("input")).toString();
+                const QString key = linkKey(output, input);
+                if (keys.contains(key)) {
+                    continue;
+                }
+                keys << key;
+                const bool isEnabled = entry.value(QStringLiteral("enabled")).toBool(true);
+                const bool connected = m_graph.links.contains(key);
+                const bool outputPresent = m_graph.outputs.contains(output);
+                const bool inputPresent = m_graph.inputs.contains(input);
+                const bool supported = isSupportedAutoConnection(output, input);
+                QString state = connected ? QStringLiteral("Connected")
+                    : !outputPresent && !inputPresent ? QStringLiteral("Both ports offline")
+                    : !outputPresent ? QStringLiteral("Source offline")
+                    : !inputPresent ? QStringLiteral("Destination offline") : QStringLiteral("Disconnected");
+                auto *channel = new QTreeWidgetItem(route);
+                channel->setText(0, leafFromAlias(output));
+                channel->setText(1, leafFromAlias(input));
+                channel->setText(2, !supported ? QStringLiteral("Unsupported") : isEnabled ? QStringLiteral("Enabled") : QStringLiteral("Paused"));
+                channel->setText(3, state);
+                channel->setText(4, QStringLiteral("1"));
+                channel->setData(0, Qt::UserRole, QStringList{key});
+                channel->setToolTip(0, output);
+                channel->setToolTip(1, input);
+                channel->setToolTip(2, isEnabled ? QStringLiteral("This channel will be restored automatically when both ports are available.")
+                    : QStringLiteral("This rule is saved but disabled. It can still be removed. Any live connection remains until disconnected."));
+                allAliases << output + QStringLiteral(" → ") + input;
+                if (isEnabled && supported) {
+                    ++enabled;
+                    ++enabledCount;
+                    if (connected) {
+                        ++activeCount;
+                    }
+                }
+                if (connected) {
+                    ++active;
+                }
+                waiting = waiting || !outputPresent || !inputPresent;
+                if (selected.size() == 1 && selected.contains(key)) {
+                    m_savedRules->setCurrentItem(channel);
+                }
+            }
+            route->setData(0, Qt::UserRole, keys);
+            route->setData(0, Qt::UserRole + 1, it.key());
+            route->setText(2, enabled == keys.size() ? QStringLiteral("Enabled") : enabled == 0 ? QStringLiteral("Paused / inactive") : QStringLiteral("Mixed"));
+            route->setText(3, QStringLiteral("%1/%2 connected%3").arg(active).arg(keys.size()).arg(waiting ? QStringLiteral(" · ports offline") : QString()));
+            route->setText(4, QString::number(keys.size()));
+            for (int column = 0; column < 5; ++column) {
+                route->setToolTip(column, QStringLiteral("This route contains %1 channel(s):\n%2\nExpand to manage individual channels.").arg(keys.size()).arg(allAliases.join(QLatin1Char('\n'))));
+            }
+            route->setExpanded(expanded.contains(it.key()));
+            QSet<QString> routeKeys(keys.begin(), keys.end());
+            if (routeKeys == selected) {
+                m_savedRules->setCurrentItem(route);
+            }
+        }
+        m_savedSummary->setText(routes.isEmpty()
+            ? QStringLiteral("No saved reconnect rules. To remember a route, choose Save reconnect rule before drawing it, or right-click an existing line.")
+            : QStringLiteral("%1 saved route%2 · %3/%4 enabled channels connected. Expand a route to see its exact ports.")
+                .arg(routes.size()).arg(routes.size() == 1 ? QString() : QStringLiteral("s")).arg(activeCount).arg(enabledCount));
+        const int legacyRules = root.value(QStringLiteral("rules")).toArray().size();
+        if (legacyRules > 0) {
+            m_savedSummary->setText(m_savedSummary->text() + QStringLiteral(" Also configured: %1 pattern rule(s) in %2.").arg(legacyRules).arg(configPath()));
+        }
+        updateSelectedRuleHelp();
+    }
+
+    void showSavedDevicesDialog() {
+        QDialog dialog(this);
+        dialog.setWindowTitle(QStringLiteral("Saved virtual audio devices"));
+        dialog.resize(760, 400);
+        auto *layout = new QVBoxLayout(&dialog);
+        auto *help = new QLabel(QStringLiteral("Saved virtual devices are recreated automatically. Forgetting a device removes that setting and keeps any running device and audio connections."), &dialog);
+        help->setWordWrap(true);
+        layout->addWidget(help);
+        auto *list = new QListWidget(&dialog);
+        layout->addWidget(list);
+        auto populate = [&] {
+            list->clear();
             const QSet<QString> sinks = currentSinkNames();
-            int runningDevices = 0;
-            int enabledDevices = 0;
+            const QJsonObject root = loadConfigRoot();
             for (const QJsonValue &value : root.value(QStringLiteral("devices")).toArray()) {
                 const QJsonObject device = value.toObject();
                 const QString name = device.value(QStringLiteral("name")).toString();
-                const QString description = device.value(QStringLiteral("description")).toString();
-                const int channels = device.value(QStringLiteral("channels")).toInt(2);
-                const bool enabled = device.value(QStringLiteral("enabled")).toBool(true);
-                const bool running = sinks.contains(name);
-                const QString state = !enabled ? QStringLiteral("Disabled")
-                                               : running ? QStringLiteral("Running") : QStringLiteral("Waiting to be created");
-                auto *item = new QListWidgetItem(QStringLiteral("%1  |  %2 - %3 (%4ch)").arg(state, name, description).arg(channels), devicesList);
+                const QString state = !device.value(QStringLiteral("enabled")).toBool(true) ? QStringLiteral("Paused")
+                    : sinks.contains(name) ? QStringLiteral("Running") : QStringLiteral("Waiting to be created");
+                auto *item = new QListWidgetItem(QStringLiteral("%1 — %2 · %3 channels · %4")
+                    .arg(name, device.value(QStringLiteral("description")).toString()).arg(device.value(QStringLiteral("channels")).toInt(2)).arg(state), list);
                 item->setData(Qt::UserRole, name);
-                item->setForeground(QColor(!enabled ? QStringLiteral("#777777")
-                                                   : running ? QStringLiteral("#238636") : QStringLiteral("#b26a00")));
-                if (enabled) {
-                    ++enabledDevices;
-                    if (running) {
-                        ++runningDevices;
-                    }
-                }
             }
-            summary->setText(QStringLiteral("%1 of %2 saved auto-connect links are connected now. %3 of %4 saved fake audio devices are running.")
-                                 .arg(connectedConnections)
-                                 .arg(enabledConnections)
-                                 .arg(runningDevices)
-                                 .arg(enabledDevices));
-            tabs->setTabText(0, QStringLiteral("Auto-connect Links (%1/%2 connected)").arg(connectedConnections).arg(enabledConnections));
-            tabs->setTabText(1, QStringLiteral("Fake Audio Devices (%1/%2 running)").arg(runningDevices).arg(enabledDevices));
         };
-
-        tabs->addTab(connectionsList, QStringLiteral("Auto-connect Links"));
-        tabs->addTab(devicesList, QStringLiteral("Fake Audio Devices"));
-        layout->addWidget(tabs);
         populate();
-
-        auto *buttons = new QDialogButtonBox(&dialog);
-        auto *refreshStatusButton = buttons->addButton(QStringLiteral("Refresh Status"), QDialogButtonBox::ActionRole);
-        auto *removeButton = buttons->addButton(QStringLiteral("Remove Selected"), QDialogButtonBox::ActionRole);
-        buttons->addButton(QDialogButtonBox::Close);
+        auto *buttons = new QDialogButtonBox(QDialogButtonBox::Close, &dialog);
+        auto *forget = buttons->addButton(QStringLiteral("Forget selected (keep running)"), QDialogButtonBox::ActionRole);
+        auto *refresh = buttons->addButton(QStringLiteral("Refresh status"), QDialogButtonBox::ActionRole);
         layout->addWidget(buttons);
-
-        connect(refreshStatusButton, &QPushButton::clicked, &dialog, [&] {
-            const SnapshotResult snapshot = loadSnapshot();
-            if (!snapshot.ok) {
-                QMessageBox::warning(&dialog, QStringLiteral("PipeWire Error"), snapshot.error);
-                return;
-            }
-            m_graph = snapshot.graph;
-            loadAutoConnections();
-            rebuildScene();
-            populate();
-        });
-        connect(removeButton, &QPushButton::clicked, &dialog, [&] {
-            if (tabs->currentWidget() == connectionsList) {
-                QListWidgetItem *item = connectionsList->currentItem();
-                if (!item) {
-                    return;
-                }
-                const auto [output, input] = splitLinkKey(item->data(Qt::UserRole).toString());
-                removeAutoReconnectEntry(output, input, true);
-            } else {
-                QListWidgetItem *item = devicesList->currentItem();
-                if (!item) {
-                    return;
-                }
+        connect(forget, &QPushButton::clicked, &dialog, [&] {
+            if (const auto *item = list->currentItem()) {
                 removeFakeAudioDeviceEntry(item->data(Qt::UserRole).toString());
+                populate();
             }
-            loadAutoConnections();
-            rebuildScene();
-            populate();
         });
+        connect(refresh, &QPushButton::clicked, &dialog, populate);
         connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
         dialog.exec();
     }
@@ -1607,70 +1855,103 @@ private:
         return QStringLiteral("%1 -> %2").arg(output, input);
     }
 
-    void removeAutoReconnectEntry(const QString &output, const QString &input, bool announce) {
-        const QString key = linkKey(output, input);
-        if (!m_autoConnections.contains(key)) {
-            return;
+    bool removeReconnectEntries(const QSet<QString> &keys, bool announce = true) {
+        QJsonObject root;
+        if (!readConfigForEdit(&root)) {
+            return false;
         }
-
-        QJsonObject root = loadConfigRoot();
         const QJsonArray connections = root.value(QStringLiteral("connections")).toArray();
         QJsonArray updated;
+        int removed = 0;
         for (const QJsonValue &value : connections) {
             const QJsonObject existing = value.toObject();
-            if (existing.value(QStringLiteral("output")).toString() == output
-                && existing.value(QStringLiteral("input")).toString() == input) {
-                continue;
+            if (keys.contains(linkKey(existing.value(QStringLiteral("output")).toString(), existing.value(QStringLiteral("input")).toString()))) {
+                ++removed;
+            } else {
+                updated.append(value);
             }
-            updated.append(existing);
         }
+        if (removed > 0) {
+            root.insert(QStringLiteral("connections"), updated);
+            if (!writeConfigRoot(root)) {
+                return false;
+            }
+        }
+        for (const QString &key : keys) {
+            m_autoConnections.remove(key);
+        }
+        if (announce && removed > 0) {
+            appendLog(QStringLiteral("Removed %1 saved reconnect channel%2").arg(removed).arg(removed == 1 ? QString() : QStringLiteral("s")));
+        }
+        return true;
+    }
 
-        root.insert(QStringLiteral("connections"), updated);
-        if (!writeConfigRoot(root)) {
-            return;
+    bool removeAutoReconnectEntry(const QString &output, const QString &input, bool announce) {
+        return removeReconnectEntries({linkKey(output, input)}, announce);
+    }
+
+    bool removeAndDisconnect(const QSet<QString> &keys) {
+        // Commit first: neither the GUI timer nor a watcher should restore a link we just removed.
+        if (!removeReconnectEntries(keys)) {
+            return false;
         }
-        m_autoConnections.remove(key);
-        if (announce) {
-            appendLog(QStringLiteral("Removed auto-reconnect: %1").arg(connectionName(output, input)));
+        // A watcher may have finished connecting while the save waited for its lock.
+        const SnapshotResult snapshot = loadSnapshot();
+        if (!snapshot.ok) {
+            appendLog(QStringLiteral("Saved rules removed, but current audio links could not be read: %1").arg(snapshot.error));
+            return false;
         }
+        m_graph = snapshot.graph;
+        bool success = true;
+        int disconnected = 0;
+        for (const QString &key : keys) {
+            const auto [output, input] = splitLinkKey(key);
+            if (m_graph.links.contains(key)) {
+                if (disconnectOne(output, input)) {
+                    ++disconnected;
+                } else {
+                    success = false;
+                }
+            }
+        }
+        appendLog(QStringLiteral("Disconnected %1 channel%2; selected saved rules removed%3")
+            .arg(disconnected).arg(disconnected == 1 ? QString() : QStringLiteral("s"))
+            .arg(success ? QString() : QStringLiteral(". Some live links could not be disconnected; see errors above")));
+        return success;
     }
 
     void setAutoReconnect(const QString &output, const QString &input, bool enabled) {
-        if (enabled && !isSupportedAutoConnection(output, input)) {
-            appendLog(QStringLiteral("Auto-reconnect skipped for unsupported link: %1").arg(connectionName(output, input)));
-            return;
-        }
-        if (!enabled) {
-            removeAutoReconnectEntry(output, input, true);
+        if (enabled) {
+            saveAutoReconnectForPairs({qMakePair(output, input)});
+        } else if (removeAutoReconnectEntry(output, input, true)) {
             rebuildScene();
-            return;
+            populateSavedRules();
         }
+    }
 
-        QJsonObject root = loadConfigRoot();
-        QJsonArray connections = root.value(QStringLiteral("connections")).toArray();
-        QJsonArray updated;
-        bool replaced = false;
-
-        for (const QJsonValue &value : connections) {
-            const QJsonObject existing = value.toObject();
-            const bool sameConnection = existing.value(QStringLiteral("output")).toString() == output
-                && existing.value(QStringLiteral("input")).toString() == input;
-            if (!sameConnection) {
-                updated.append(existing);
-                continue;
+    bool saveAutoReconnectForPairs(const QList<QPair<QString, QString>> &pairs, const QSet<QString> &removeKeys = {}) {
+        QMap<QString, QPair<QString, QString>> desired;
+        for (const auto &pair : pairs) {
+            if (!isSupportedAutoConnection(pair.first, pair.second)) {
+                appendLog(QStringLiteral("This route cannot be saved: reconnect rules support app/monitor outputs → playback inputs. Choose Connect once to connect it without a rule."));
+                return false;
             }
-            replaced = true;
-            QJsonObject connection = existing;
-            connection.insert(QStringLiteral("name"), connectionName(output, input));
-            connection.insert(QStringLiteral("output"), output);
-            connection.insert(QStringLiteral("input"), input);
-            connection.insert(QStringLiteral("enabled"), true);
-            connection.insert(QStringLiteral("disconnect_others"), false);
-            connection.insert(QStringLiteral("linger"), true);
-            updated.append(connection);
+            desired.insert(linkKey(pair.first, pair.second), pair);
         }
-
-        if (!replaced) {
+        QJsonObject root;
+        if (!readConfigForEdit(&root)) {
+            return false;
+        }
+        QJsonArray updated;
+        for (const QJsonValue &value : root.value(QStringLiteral("connections")).toArray()) {
+            const QJsonObject entry = value.toObject();
+            const QString key = linkKey(entry.value(QStringLiteral("output")).toString(), entry.value(QStringLiteral("input")).toString());
+            if (!removeKeys.contains(key) && !desired.contains(key)) {
+                updated.append(value);
+            }
+        }
+        for (auto it = desired.cbegin(); it != desired.cend(); ++it) {
+            const auto [output, input] = it.value();
             QJsonObject connection;
             connection.insert(QStringLiteral("name"), connectionName(output, input));
             connection.insert(QStringLiteral("output"), output);
@@ -1680,37 +1961,32 @@ private:
             connection.insert(QStringLiteral("linger"), true);
             updated.append(connection);
         }
-
         root.insert(QStringLiteral("connections"), updated);
         if (!writeConfigRoot(root)) {
-            return;
+            return false;
         }
-
-        const QString key = linkKey(output, input);
-        m_autoConnections.insert(key);
-        appendLog(QStringLiteral("Enabled auto-reconnect: %1").arg(connectionName(output, input)));
+        loadAutoConnections();
+        appendLog(QStringLiteral("Saved reconnect route (%1 channel%2)").arg(desired.size()).arg(desired.size() == 1 ? QString() : QStringLiteral("s")));
         rebuildScene();
-    }
-
-    void saveAutoReconnectForPairs(const QList<QPair<QString, QString>> &pairs) {
-        for (const auto &pair : pairs) {
-            setAutoReconnect(pair.first, pair.second, true);
-        }
+        populateSavedRules();
+        return true;
     }
 
     void applySavedConnections(bool quiet) {
         const QString script = QDir(appSourceDir()).filePath(QStringLiteral("pipewire_auto_router.py"));
         const CommandResult result = runCommand(QStringLiteral("python3"), {script, QStringLiteral("--apply")}, 12000);
         const QString text = (result.output + QLatin1Char('\n') + result.error).trimmed();
-        if (!quiet) {
-            appendLog(text.isEmpty() ? QStringLiteral("Saved auto-reconnect connections applied") : text);
+        if (!quiet || !result.ok) {
+            appendLog(text.isEmpty()
+                ? result.ok ? QStringLiteral("Checked saved reconnect rules") : QStringLiteral("Could not reconnect saved rules")
+                : text);
         } else if (text.contains(QStringLiteral(": connect ")) || text.contains(QStringLiteral(": disconnect "))) {
             appendLog(text);
         }
-        if (!result.ok) {
-            statusBar()->showMessage(QStringLiteral("Applying auto-reconnect failed"));
-        }
         refreshGraph(false);
+        if (!result.ok) {
+            statusBar()->showMessage(QStringLiteral("Could not reconnect saved rules. See Activity for details."));
+        }
     }
 
     void appendLog(const QString &message) {
@@ -1726,11 +2002,18 @@ private:
     PatchbayView *m_view = nullptr;
     QGraphicsScene *m_scene = nullptr;
     QPlainTextEdit *m_log = nullptr;
-    QCheckBox *m_audioOnly = nullptr;
-    QCheckBox *m_pairChannels = nullptr;
-    QCheckBox *m_autoReconnectNewLinks = nullptr;
-    QCheckBox *m_autoApplyReconnect = nullptr;
-    QCheckBox *m_liveRefresh = nullptr;
+    friend class RouterUiTests;
+    QTabWidget *m_tabs = nullptr;
+    QComboBox *m_portFilter = nullptr;
+    QComboBox *m_channelMode = nullptr;
+    QComboBox *m_connectionLifetime = nullptr;
+    QLabel *m_drawingHelp = nullptr;
+    QTreeWidget *m_savedRules = nullptr;
+    QLabel *m_savedSummary = nullptr;
+    QLabel *m_selectedRuleHelp = nullptr;
+    QPushButton *m_removeRuleButton = nullptr;
+    QPushButton *m_forgetRuleButton = nullptr;
+    mutable QString m_configReadError;
     QTimer m_refreshTimer;
     Graph m_graph;
     QHash<QString, NodeItem *> m_items;
@@ -1746,6 +2029,7 @@ private:
 
 } // namespace
 
+#ifndef PIPEWIRE_AUTO_ROUTER_UI_TEST
 int main(int argc, char **argv) {
     bool checkOnly = false;
     for (int i = 1; i < argc; ++i) {
@@ -1780,3 +2064,4 @@ int main(int argc, char **argv) {
     window.show();
     return app.exec();
 }
+#endif

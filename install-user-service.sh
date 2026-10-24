@@ -26,5 +26,6 @@ WantedBy=default.target
 SERVICE
 
 systemctl --user daemon-reload
-systemctl --user enable --now pipewire-auto-router.service
+systemctl --user enable pipewire-auto-router.service
+systemctl --user restart pipewire-auto-router.service
 systemctl --user status --no-pager pipewire-auto-router.service

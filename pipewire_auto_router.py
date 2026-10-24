@@ -4,12 +4,15 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import os
 import re
+import select
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Iterable
@@ -155,6 +158,18 @@ class Config:
         tmp.replace(path)
 
 
+@contextmanager
+def config_lock(path: Path):
+    """Serialize saved-rule writes with applies already in progress."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.with_name(path.name + ".lock").open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
 @dataclass
 class GraphSnapshot:
     outputs: list[str]
@@ -169,7 +184,10 @@ def normal_choice(value: object, choices: Iterable[str], default: str) -> str:
 
 
 def run_command(args: list[str]) -> str:
-    completed = subprocess.run(args, check=False, text=True, capture_output=True)
+    try:
+        completed = subprocess.run(args, check=False, text=True, capture_output=True, timeout=6)
+    except subprocess.TimeoutExpired as exc:
+        raise PipeWireCommandError(f"{' '.join(args)} failed: timed out after 6 seconds") from exc
     if completed.returncode != 0:
         detail = completed.stderr.strip() or completed.stdout.strip() or f"exit {completed.returncode}"
         raise PipeWireCommandError(f"{' '.join(args)} failed: {detail}")
@@ -182,14 +200,14 @@ class PipeWireGraphMonitor:
     def __init__(self) -> None:
         self.process = None
         self.object_types: dict[object, str] = {}
+        self._buffer = b""
 
     def __enter__(self) -> "PipeWireGraphMonitor":
         self.process = subprocess.Popen(
             ["pw-dump", "--monitor", "--raw", "--no-colors"],
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
-            text=True,
-            bufsize=1,
+            bufsize=0,
         )
         try:
             initial_objects = self._read_objects()
@@ -217,23 +235,42 @@ class PipeWireGraphMonitor:
         if self.process.stdout is not None:
             self.process.stdout.close()
         self.process = None
+        self._buffer = b""
 
-    def wait_for_change(self) -> bool:
-        """Block until a relevant graph change occurs or the monitor exits."""
+    def wait_for_change(self, timeout: float | None = None) -> bool | None:
+        """Return True for changes, False for EOF, or None when the timeout expires."""
+        deadline = None if timeout is None else time.monotonic() + timeout
         while True:
-            objects = self._read_objects()
+            if deadline is not None and time.monotonic() >= deadline:
+                return None
+            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            try:
+                objects = self._read_objects(remaining)
+            except TimeoutError:
+                return None
             if objects is None:
                 return False
             if self._update_object_types(objects, detect_changes=True):
                 return True
 
-    def _read_objects(self) -> list[dict] | None:
+    def _read_objects(self, timeout: float | None = None) -> list[dict] | None:
         if self.process is None or self.process.stdout is None:
             return None
+        deadline = None if timeout is None else time.monotonic() + timeout
         while True:
-            line = self.process.stdout.readline()
-            if line == "":
-                return None
+            if b"\n" not in self._buffer:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError
+                remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+                ready, _, _ = select.select([self.process.stdout], [], [], remaining)
+                if not ready:
+                    raise TimeoutError
+                chunk = os.read(self.process.stdout.fileno(), 65536)
+                if not chunk:
+                    return None
+                self._buffer += chunk
+                continue
+            line, self._buffer = self._buffer.split(b"\n", 1)
             try:
                 objects = json.loads(line)
             except json.JSONDecodeError:
@@ -409,7 +446,7 @@ class PipeWireBackend:
         args = ["pw-link"]
         if linger:
             args.append("-L")
-        args.extend(["-w", output, input_])
+        args.extend([output, input_])
         run_command(args)
 
     def disconnect(self, output: str, input_: str) -> None:
@@ -633,15 +670,49 @@ def print_watch_messages(messages: list[str]) -> None:
         print(f"{time.strftime('%H:%M:%S')} {message}", flush=True)
 
 
-def watch_config(backend: PipeWireBackend, config: Config, dry_run: bool = False) -> None:
-    """Apply the config initially and whenever PipeWire reports a useful change."""
-    retry_delay = max(config.interval_seconds, 0.5)
+def config_signature(path: Path) -> tuple[int, int, int, int] | None:
+    try:
+        stat = path.stat()
+        return stat.st_dev, stat.st_ino, stat.st_mtime_ns, stat.st_size
+    except FileNotFoundError:
+        return None
+
+
+def watch_config(backend: PipeWireBackend, config_path: Path, dry_run: bool = False) -> None:
+    """Reload saved rules on graph/file changes; never restore a stale deleted rule."""
+    retry_delay = 2.0
+    last_error = None
+
+    def apply_current_config() -> None:
+        nonlocal retry_delay, last_error
+        try:
+            with config_lock(config_path):
+                config = Config.load(config_path)
+                messages = backend.apply_config(config, dry_run=dry_run)
+        except (OSError, ValueError, TypeError) as exc:
+            # A broken or unreadable file must not keep old reconnect rules alive.
+            message = f"Cannot load {config_path}; reconnect paused: {exc}"
+            if message != last_error:
+                print(message, file=sys.stderr, flush=True)
+            last_error = message
+            return
+        last_error = None
+        retry_delay = max(config.interval_seconds, 0.5)
+        print_watch_messages(messages)
+
     while True:
         try:
             with PipeWireGraphMonitor() as monitor:
-                print_watch_messages(backend.apply_config(config, dry_run=dry_run))
-                while monitor.wait_for_change():
-                    print_watch_messages(backend.apply_config(config, dry_run=dry_run))
+                signature = config_signature(config_path)
+                apply_current_config()
+                while True:
+                    changed = monitor.wait_for_change(timeout=0.5)
+                    if changed is False:
+                        break
+                    current_signature = config_signature(config_path)
+                    if changed or current_signature != signature:
+                        signature = current_signature
+                        apply_current_config()
         except (OSError, PipeWireCommandError) as exc:
             print(f"{time.strftime('%H:%M:%S')} PipeWire monitor failed: {exc}", file=sys.stderr, flush=True)
         time.sleep(retry_delay)
@@ -662,14 +733,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.apply or args.watch:
-        config = Config.load(args.config)
-        if not config.connections and not config.devices:
-            print(f"No saved fake devices or auto-reconnect connections in {args.config}")
-            return 1
         if args.watch:
-            watch_config(backend, config, dry_run=args.dry_run)
+            watch_config(backend, args.config, dry_run=args.dry_run)
             return 0
-        messages = backend.apply_config(config, dry_run=args.dry_run)
+        with config_lock(args.config):
+            config = Config.load(args.config)
+            messages = backend.apply_config(config, dry_run=args.dry_run)
         for message in messages or ["No changes needed"]:
             print(f"{time.strftime('%H:%M:%S')} {message}", flush=True)
         return 0

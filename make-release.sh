@@ -14,9 +14,9 @@ if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     exit 1
 fi
 
-cmake -S "$script_dir" -B "$build_dir" -DCMAKE_BUILD_TYPE=Release
+cmake -S "$script_dir" -B "$build_dir" -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
 cmake --build "$build_dir" --parallel
-python3 -m unittest discover -s "$script_dir/tests" -q
+ctest --test-dir "$build_dir" --output-on-failure --no-tests=error
 
 binary_stage="$release_tmp/$release_name-linux-x86_64"
 source_stage="$release_tmp/$release_name-source"
@@ -38,6 +38,8 @@ for file in pipewire_auto_router.py run-qt.sh install-kde-app.sh install-user-se
 done
 install -m 0644 "$script_dir/src/qt_main.cpp" "$source_stage/src/qt_main.cpp"
 install -m 0644 "$script_dir/tests/test_backend.py" "$source_stage/tests/test_backend.py"
+install -m 0644 "$script_dir/tests/test_installers.py" "$source_stage/tests/test_installers.py"
+install -m 0644 "$script_dir/tests/test_qt.cpp" "$source_stage/tests/test_qt.cpp"
 
 binary_archive="$dist_dir/$release_name-linux-x86_64.tar.gz"
 source_archive="$dist_dir/$release_name-source.tar.gz"

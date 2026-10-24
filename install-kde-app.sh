@@ -35,5 +35,9 @@ elif command -v kbuildsycoca5 >/dev/null 2>&1; then
     kbuildsycoca5 --noincremental >/dev/null 2>&1 || true
 fi
 
+if command -v systemctl >/dev/null 2>&1 && systemctl --user is-active --quiet pipewire-auto-router.service; then
+    systemctl --user restart pipewire-auto-router.service
+fi
+
 printf 'Installed PipeWire Auto Router in the KDE application menu.\n'
 printf 'Desktop entry: %s\n' "$desktop_path"

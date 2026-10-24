@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.3.0 - 2026-10-24
+
+- Reload saved reconnect rules in the background watcher so deleted routes stay
+  deleted, and adopt rule edits even while the PipeWire graph is idle.
+- Keep watching empty configurations and pause restoration on invalid files.
+- Separate live connections and saved reconnect rules into dedicated tabs.
+- Replace ambiguous routing checkboxes with explained connection and channel
+  choices, group saved stereo channels, and distinguish forgetting a rule from
+  removing it and disconnecting its live audio.
+- Save rule removals atomically before disconnecting, coordinated with any
+  reconnect already in progress, and preserve audio if saving fails.
+- Add isolated Qt UI and watcher regression coverage to the release checks.
+- Restart an active background watcher during upgrades so the new backend takes
+  effect immediately.
+
 ## 0.2.1 - 2026-10-14
 
 - Make the headless watcher react to PipeWire graph events instead of polling
